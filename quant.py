@@ -1,4 +1,3 @@
-# coding: utf-8
 import CAL
 import datetime
 import numpy as np
@@ -40,17 +39,24 @@ class MyQuant(object):
 		self.__risk = risk
 
 	def stockChoosing(self):
-		preday=self.__calendar.advanceDate(self.__account.current_date,trainperiod).strftime('%Y%m%d')
-		yesterday=self.__calendar.advanceDate(self.__account.current_date,'-1B').strftime('%Y%m%d')
+		# strftime('%Y%m%d')
+		print self.__calendar.advanceDate(self.__account.current_date,trainperiod)
+		preday=self.__calendar.advanceDate(self.__account.current_date,trainperiod)
+		yesterday=self.__calendar.advanceDate(self.__account.current_date,'-1B')
 		#获得训练第一天和上一个收盘日
 		##############################################
 
 		#各列分别是secid，3个月前的因子值，3个月内的强弱（1代表比大盘强，0代表比大盘弱）
-		fac=DataAPI.MktStockFactorsOneDayGet(
-			tradeDate=preday,
-			secID=self.__account.universe,
-			field=['secID']+factor,
-			pandas="1")
+		fac =  self.__getTrades(
+			self.__account.universe,
+			field = ['highestPrice'],
+			beginDate = preday, endDate = preday)
+		
+		# fac=DataAPI.MktStockFactorsOneDayGet(
+		#     tradeDate=preday,
+		#     secID=self.__account.universe,
+		#     field=['secID']+factor,
+		#     pandas="1")
 		#创建价格df:price
 		price1=DataAPI.MktEqudAdjGet(
 			secID=self.__account.universe,
@@ -95,13 +101,18 @@ class MyQuant(object):
 
 		###########################
 		#建立test集
-		test1 = DataAPI.MktStockFactorsOneDayGet(
-			tradeDate=yesterday,
-			secID=self.__account.universe,
+		testData = self.__getTrades(
+			self.__account.universe,
 			field=['secID']+factor,
-			pandas="1")
-		test1=test1.dropna()
-		test=test1.iloc[:,1:].values
+			days=1
+		)
+		# test1 = DataAPI.MktStockFactorsOneDayGet(
+		#     tradeDate=yesterday,
+		#     secID=self.__account.universe,
+		#     field=['secID']+factor,
+		#     pandas="1")
+		testData = testData.dropna()
+		testestDatat=testData.iloc[:,1:].values
 
 		#################### core #########################
 		# 创建并且训练一个支持向量机分类模型,根据上一个交易日的因子预测涨跌,返回预测涨幅最大的前10支股票
@@ -115,10 +126,10 @@ class MyQuant(object):
 		test1['predict']=predicted_results    
 
 		#按照判断涨的概率排序
-		test1=test1.sort(columns='predict',ascending=False)
+		testData=testData.sort(columns='predict',ascending=False)
 		#选概率大于0.5的股
-		test1=test1[test1['predict']>=0.5]
-		buylist=test1['secID'][:20]#选概率最大的50只股票
+		testData=testData[test1['predict']>=0.5]
+		buylist=testData['secID'][:20]#选概率最大的50只股票
 		self.__stockPool = buylist.to_dict().values()
 		
 		return self.__stockPool
@@ -150,7 +161,7 @@ class MyQuant(object):
 				#获取每只股票的进仓量
 				positionQuantity = self.__stockMaxQuantity(stock)
 				#产生下单信号
-				# order_to(stock, positionQuantity)
+				order_to(stock, positionQuantity)
 		
 	#每只股票最大进仓量
 	def __stockMaxQuantity(self,stock):
@@ -169,6 +180,7 @@ class MyQuant(object):
 		# #止损点
 		lowerLimit = min10 * (1 - 0.08)
 		# #计算交易量
+		# print np.absolute(highestPrice-lowerLimit)
 		volume = max_lose / (highestPrice - lowerLimit)
 		return volume
 	
@@ -193,12 +205,14 @@ class MyQuant(object):
 		dealSingal = (highestPrice > upperLimit) or (highestPrice < lowerLimit)
 		return dealSingal
 		
+	
 	def __IdxMA(self, days = 100, ticker = u'000001'):
 		beginDate = self.__calendar.advanceDate(self.__date, '-' + str(days) + 'B').strftime('%Y%m%d')
 		endDate = self.__calendar.advanceDate(self.__date, '-1B').strftime('%Y%m%d')
 		idxs = DataAPI.MktIdxFactorDateRangeGet(ticker = ticker, beginDate = beginDate, endDate = endDate, field = ['tradeDate', 'Close'], pandas = '1').loc[:]['Close'].values
 		ma = np.mean([float(idx) for idx in idxs])
 		return ma
+	
 	
 	def __MA(self, secID, days):
 		ma = {}
@@ -228,23 +242,22 @@ class MyQuant(object):
 
 		sql = '(secID == "' + '" | secID == "'.join(secID) + '") & tradeDate >= "' + beginDate.strftime('%Y-%m-%d') + '" & tradeDate <= "' + endDate.strftime('%Y-%m-%d') + '"'
 
-		# if 'secID' not in self.__tradeCache.columns or self.__tradeCache.query(sql).empty:
-		#     fields = list(set(field + ['secID', 'tradeDate', 'closePrice']))
-		#     print fields
-		#     self.__tradeCache = DataAPI.MktEqudGet(
-		#         secID = self.__stockPool,
-		#         beginDate = beginDate,
-		#         endDate = self.__calendar.advanceDate(endDate, '+100B'),
-		#         field = list(set(field + ['secID', 'tradeDate', 'closePrice'])),
-		#         pandas = '1'
-		#     )
-		#     log.info(sql + ' missing')
+		if 'secID' not in self.__tradeCache.columns or self.__tradeCache.query(sql).empty:
+			fields = list(set(field + ['secID', 'tradeDate', 'closePrice']))
+			self.__tradeCache = DataAPI.MktEqudGet(
+				secID = self.__stockPool,
+				beginDate = beginDate,
+				endDate = self.__calendar.advanceDate(endDate, '+100B'),
+				field = list(set(field + ['secID', 'tradeDate', 'closePrice'])),
+				pandas = '1'
+			)
+			log.info(sql + ' missing')
 		#fields = list(set(field + ['secID', 'tradeDate', 'closePrice']))
-		self.__tradeCache = DataAPI.MktEqudGet(
-			secID = self.__stockPool,
-			beginDate = beginDate,
-			endDate = self.__calendar.advanceDate(endDate, '+100B'),
-			field = list(set(field + ['secID', 'tradeDate', 'closePrice'])),
-			pandas = '1'
-		)
+		# self.__tradeCache = DataAPI.MktEqudGet(
+		#     secID = self.__stockPool,
+		#     beginDate = beginDate,
+		#     endDate = self.__calendar.advanceDate(endDate, '+100B'),
+		#     field = list(set(field + ['secID', 'tradeDate', 'closePrice'])),
+		#     pandas = '1'
+		# )
 		return self.__tradeCache.query(sql)
