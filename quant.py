@@ -1,263 +1,177 @@
-import CAL
 import datetime
 import numpy as np
 import pandas as pd
 from sklearn.svm import SVC
-from lib.detect_peaks import detect_peaks
+from sklearn.cross_validation import train_test_split
 
-start = '2013-01-01'                       # 回测起始时间
-end = '2017-01-01'                         # 回测结束时间
-benchmark = 'HS300'                        # 策略参考标准
-universe = set_universe('HS300')           # 证券池，支持股票和基金
-capital_base = 100000                      # 起始资金
-freq = 'd'                                 # 策略类型，'d'表示日间策略使用日线回测，'m'表示日内策略使用分钟线回测
-refresh_rate = 1                           # 调仓频率，表示执行handle_data的时间间隔，若freq = 'd'时间间隔的单位为交易日，若freq = 'm'时间间隔为分钟
 
-trainperiod='-3M'#训练周期3个月
-factor=['ROE','ROA','EPS','EBITDA','PR','L/A','FixAssetRatio','CMV','PE','EV/EBITDA','PS','DividendYieldRatio','B/M']#选3个
-cal = CAL.Calendar('China.SSE')#创建日历
 
-def initialize(account):                   # 初始化虚拟账户状态
+start_date ='20161031'
+end_date = '20170105'
+factor_date = '20161031'#为了获取10月末的因子数据而设定的日期参数
+index = '000300.SH'#沪深300指数
+# stock_sample = get_index_stocks(index,start_date)#选取起始时间作为参数来构建沪深300指数成分股股票池
+# trade_days = get_trade_days(start_date,end_date)#获取交易日时段
+
+trade_days = get_all_trade_days()
+factors = ['factor_ma', 'factor_bbi']
+
+class CAL(object):
+	def __init__(self):
+		#获取所交易日
+		days = get_all_trade_days()
+		#日期格式化
+		days = [day.strftime('%Y%m%d') for day in days]
+		#创建DateFarme
+		self.tradeDate = pd.DataFrame(days,columns=['date'])
+
+	def getDate(self,date):
+		#在tradeDate中查询这一天是否存在
+		queryCondition = ""
+		if isinstance(date, str):
+			queryCondition = 'date>="' + date + '"'
+		else:            
+			queryCondition = 'date>="' + date.strftime('%Y%m%d') + '"'
+			log.info(queryCondition)
+
+		date = self.tradeDate.query(queryCondition)
+		return datetime.datetime.strptime(date['date'].values[0], "%Y%m%d")
+
+	def getDateByAdvance(self,date,step):
+		log.info(date)
+		queryCondition = 'date>= "' + self.getDate(date).strftime('%Y%m%d') + '"'
+		log.info(queryCondition)
+
+		index = int(self.tradeDate.query(queryCondition).index[0])+step
+		
+		
+		if index >=0 and index < self.tradeDate.shape[0]:
+			return datetime.datetime.strptime(self.tradeDate['date'].values[index], "%Y%m%d")
+		return None
+
+def train_model(data,samples, currentDay):
+	# trade_days = get_trade_days(beginDate, endDate).strftime('%Y-%m-%d')
+	# currentDay = trade_days[1]
+	cal = CAL()
+	lastDay = cal.getDateByAdvance(currentDay,-1).strftime('%Y-%m-%d')
+	currentDay = currentDay.strftime("%Y-%m-%d")
+	log.info("获取因子...")
+	#获取因子数据
+	factor_df = pd.DataFrame(columns=['stockID', 'factor_date'] + factors)
+	for stock in samples:
+		facQuery = query(factor.date,factor.ma,factor.bbi).filter(factor.symbol == stock,factor.date.in_([lastDay]))
+		fac = get_factors(facQuery) 
+		fac.insert(0,'stockID',stock)
+		factor_df = pd.concat([factor_df,fac], ignore_index=True)
+
+	factor_df =factor_df.sort_index(by=['factor_date','stockID'])   
+
+	log.info("获取每日收盘价...")
+	#获取每日收盘价
+	samplePrice = data.history(samples, 'close', 2, '1d', skip_paused = False, fq = None, is_panel = 1)
+	# samplePrice = get_price(samples, beginDate, endDate, '1d', ['close'], True, None,is_panel=1)
+	closePrice = samplePrice['close']
+	closeIndex = closePrice.index
+	
+	#计算涨幅
+	increase = {}
+	for i in range(1,len(closePrice)):
+		#获取索引
+		index = closeIndex[i]
+		lastIndex = closeIndex[i-1]
+		#获取当天与上一天的收盘价
+		currentPrice = closePrice.loc[index]
+		lastPrice = closePrice.loc[lastIndex]
+		#计算涨幅
+		increaseRatio = (currentPrice - lastPrice) / lastPrice * 100
+		increase[index] = increaseRatio
+
+	increase_df=pd.DataFrame(increase)  
+
+	log.info("构建训练集...")
+	price = increase_df[lastDay].values
+	factor_df.insert(1,'increaseRatio',price)
+	traindf = factor_df
+	traindf=traindf.dropna()
+	traindf=traindf.sort_index(by='increaseRatio')
+
+	# target二值化，大于平均数的设置1，小于平均数的设置0
+	target=list(traindf['increaseRatio'].apply(lambda x:1 if x>np.mean(list(traindf['increaseRatio'])) else 0))
+	
+	#生成数据集
+	del traindf['increaseRatio']
+	del traindf['factor_date']
+	
+	log.info("构建测试集...")
+	#构建测试集
+	X_test = factor_df
+	X_test = X_test.dropna()
+
+	log.info("开始拟合...")
+	# 创建并且训练一个支持向量机分类模型,根据上一个交易日的因子预测涨跌,返回预测涨幅最大的前10支股票
+	clf = SVC(probability=True)  
+	#clf是支持向量机模型，开启概率估计
+	clf.fit(traindf.iloc[:,1:].values, np.array(target))
+	#fit就是训练模型，让模型适应数据
+	log.info("开始预测...")
+
+	#预测值，predict_proba会输出两个类型的概率，输出的类型是[[0类的概率，1类的概率],[0类的概率，1类的概率]，。。。]，所以选择X[1]是选择判别为1类（涨）的概率，下面要排序
+	predicted_results = [x[1] for index, x in enumerate(clf.predict_proba(X_test.iloc[:,-2:].values))]
+	
+
+	X_test.insert(0,'predict',predicted_results)
+	
+	# #按照判断涨的概率排序
+	X_test=X_test.sort_index(by='predict')
+	# #选概率大于0.5的股
+	test=X_test[X_test['predict']>=0.5]
+	buylist=test['stockID'][:20]#选概率最大的20只股票
+	log.info(buylist)
+
+	return buylist
+
+#初始化账户       
+def initialize(account): 
+	account.sample = '000300.SH'
+	account.max_stocks = 5 # 最大持有股数
+	cal = CAL()
+	# end_date = datetime.datetime.strptime("2016-5-23", "%Y-%m-%d")
+	# begin_date = datetime.datetime.strptime(cal.getDateByAdvance(end_date,-1), "%Y%m%d")
+	samples = get_index_stocks(account.sample, end_date)
+	
+	# train_model(account,samples, begin_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"))
+
+	pass
+	
+
+#设置买卖条件，每个交易频率（日/分钟/tick）调用一次   
+def handle_data(account,data): 
+	currentDay = get_datetime()
+	samples = get_index_stocks(account.sample, end_date)
+	buylist = train_model(data,samples,currentDay)
+	# log.info(buylist[:])
+	account.security = buylist[0:5]
+	
+	close = data.attribute_history(account.security, ['close'], 20, '1d')      
+	#计算五日均线价格      
+	MA5 = close.values[-5:].mean()      
+	#计算二十日均线价格      
+	MA20 = close.values.mean()      
+	#如果五日均线大于二十日均线      
+	if MA5 > MA20:        
+		#使用所有现金买入证券 
+		order_value(account.security,account.cash)
+
+		# for i in range(5):
+		#记录这次买入        
+		log.info("买入 %s" % (account.security))       
+	#如果五日均线小于二十日均线，并且目前有头寸      
+	if MA5 < MA20 and account.positions_value > 0:        
+		#卖出所有证券        
+		order_target(account.security,0)        
+		#记录这次卖出        
+		log.info("卖出 %s" % (account.security))
+	
 	pass
 
-def handle_data(account):                  # 每个交易日的买入卖出指令
-	
-	myQuant = MyQuant(account, account.current_date)
-	myQuant.timing()
-	
-class MyQuant(object):
-	
-	def __init__(self, account, date = datetime.date.today(), MAthreshold = 0, stocks = [],risk=0.02):
-		self.__account = account
-		self.__calendar = CAL.Calendar('China.SSE')
-		self.__date = date
-		self.__tradeCache = pd.DataFrame()
-		self.__MAthreshold = MAthreshold
-		self.__stockPool = stocks if stocks else self.__account.universe
-		self.__boughtPool = []
-		self.__IdxMA()
-		self.__risk = risk
-
-	def stockChoosing(self):
-		# strftime('%Y%m%d')
-		print self.__calendar.advanceDate(self.__account.current_date,trainperiod)
-		preday=self.__calendar.advanceDate(self.__account.current_date,trainperiod)
-		yesterday=self.__calendar.advanceDate(self.__account.current_date,'-1B')
-		#获得训练第一天和上一个收盘日
-		##############################################
-
-		#各列分别是secid，3个月前的因子值，3个月内的强弱（1代表比大盘强，0代表比大盘弱）
-		fac =  self.__getTrades(
-			self.__account.universe,
-			field = ['highestPrice'],
-			beginDate = preday, endDate = preday)
-		
-		# fac=DataAPI.MktStockFactorsOneDayGet(
-		#     tradeDate=preday,
-		#     secID=self.__account.universe,
-		#     field=['secID']+factor,
-		#     pandas="1")
-		#创建价格df:price
-		price1=DataAPI.MktEqudAdjGet(
-			secID=self.__account.universe,
-			tradeDate=preday,
-			field=u"secID,closePrice",pandas="1")
-		price2=DataAPI.MktEqudAdjGet(
-			secID=self.__account.universe,
-			tradeDate=yesterday,
-			field=u"secID,closePrice",pandas="1")
-
-		price2['closePrice2']=price2['closePrice']
-		del price2['closePrice']
-		price=pd.merge(price1,price2)
-
-		tmp1=[]
-		tmp=(price['closePrice2']-price['closePrice']) / price['closePrice'] * 100
-
-		for i in tmp:
-			tmp1.append(int(i))
-
-		price['zhangdie']=tmp1
-		del price['closePrice']
-		del price['closePrice2']
-
-		traindf=pd.merge(fac,price)
-		traindf.set_index(traindf.secID)
-		del traindf['secID']
-
-		traindf=traindf.dropna()
-		traindf=traindf.sort(columns='zhangdie')
-		traindf.reset_index(drop=True,inplace=True)
-
-		traindf=traindf.iloc[:len(traindf['zhangdie'])/10*3,:].append(traindf.iloc[len(traindf['zhangdie'])/10*7:,:])
-
-
-		##################
-		#target二值化，大于平均数的设置1，小于平均数的设置0
-		target=list(traindf['zhangdie'].apply(lambda x:1 if x>np.mean(list(traindf['zhangdie'])) else 0))
-
-		train=traindf.iloc[:,0:-1].values
-		#构建train列表和target列表完毕
-
-		###########################
-		#建立test集
-		testData = self.__getTrades(
-			self.__account.universe,
-			field=['secID']+factor,
-			days=1
-		)
-		# test1 = DataAPI.MktStockFactorsOneDayGet(
-		#     tradeDate=yesterday,
-		#     secID=self.__account.universe,
-		#     field=['secID']+factor,
-		#     pandas="1")
-		testData = testData.dropna()
-		testestDatat=testData.iloc[:,1:].values
-
-		#################### core #########################
-		# 创建并且训练一个支持向量机分类模型,根据上一个交易日的因子预测涨跌,返回预测涨幅最大的前10支股票
-		clf = SVC(probability=True)  
-		#clf是支持向量机模型，开启概率估计
-		clf.fit(train, target)
-		#fit就是训练模型，让模型适应数据
-
-		#预测值，predict_proba会输出两个类型的概率，输出的类型是[[0类的概率，1类的概率],[0类的概率，1类的概率]，。。。]，所以选择X[1]是选择判别为1类（涨）的概率，下面要排序
-		predicted_results = [x[1] for index, x in enumerate(clf.predict_proba(test))]
-		test1['predict']=predicted_results    
-
-		#按照判断涨的概率排序
-		testData=testData.sort(columns='predict',ascending=False)
-		#选概率大于0.5的股
-		testData=testData[test1['predict']>=0.5]
-		buylist=testData['secID'][:20]#选概率最大的50只股票
-		self.__stockPool = buylist.to_dict().values()
-		
-		return self.__stockPool
-	
-	def timing(self, stocks = []):
-		self.__stockPool = stocks if stocks else self.stockChoosing()
-
-		
-		for stock in self.__stockPool:
-			MA100 = self.__MA(stock, 100)
-			MA20 = self.__MA(stock, 20)
-			MA30 = self.__MA(stock, 30)
-			MA = (MA20 + MA30) / 2
-
-			if self.__IdxMA(1) > self.__IdxMA():
-				if stock not in self.__boughtPool and self.__MA(stock, days = 1) > (MA * 1.03):
-					# order_pct_to(stock, 1. / len(self.__stockPool))
-					self.__positionControl()
-					self.__boughtPool.append(stock)
-				elif stock in self.__boughtPool and self.__MA(stock, days = 1) < (MA * 0.97):
-					order_to(stock, 0)
-					self.__boughtPool.remove(stock)
-	
-	#仓控
-	def __positionControl(self):
-		#遍历股票池中每只股票
-		for stock in self.__stockPool:
-			if stock not in self.__boughtPool:
-				#获取每只股票的进仓量
-				positionQuantity = self.__stockMaxQuantity(stock)
-				#产生下单信号
-				order_to(stock, positionQuantity)
-		
-	#每只股票最大进仓量
-	def __stockMaxQuantity(self,stock):
-		#最大风险随时
-		max_lose = self.__account.cash * self.__risk
-		beginDate = self.__calendar.advanceDate(self.__date, '-10B')
-		#获取今日最高价
-		highestPrice = self.__getTrades(
-			[stock],
-			field = ['highestPrice'],
-			beginDate = self.__date, endDate = self.__date)['closePrice'].values[0]
-		#10十日内收盘价
-		historyTrade10 = self.__getTrades([stock],days=10).sort_index(by='closePrice')
-		# #10日内最低价格
-		min10 = historyTrade10['closePrice'].values[0]
-		# #止损点
-		lowerLimit = min10 * (1 - 0.08)
-		# #计算交易量
-		# print np.absolute(highestPrice-lowerLimit)
-		volume = max_lose / (highestPrice - lowerLimit)
-		return volume
-	
-	def __stopProfile(self):
-		#10十日内收盘价
-		historyTrade10 = self.__getTrades([stock],days=10).sort_index(by='closePrice')['closePrice'].values  
-		#10日内最高价
-		max10 = historyTrade10[-1:]
-		#10日内最低价
-		min10 = historyTrade10[0]
-
-		#获取今日最高价
-		highestPrice = self.__getTrades(
-			[stock],
-			field = ['highestPrice'],
-			beginDate = self.__date, endDate = self.__date)['closePrice'].values[0]
-		#止盈
-		upperLimit = max10 * (1+0.08) 
-		#止损
-		lowerLimit = min10 * (1-0.08) 
-		#买卖信号
-		dealSingal = (highestPrice > upperLimit) or (highestPrice < lowerLimit)
-		return dealSingal
-		
-	
-	def __IdxMA(self, days = 100, ticker = u'000001'):
-		beginDate = self.__calendar.advanceDate(self.__date, '-' + str(days) + 'B').strftime('%Y%m%d')
-		endDate = self.__calendar.advanceDate(self.__date, '-1B').strftime('%Y%m%d')
-		idxs = DataAPI.MktIdxFactorDateRangeGet(ticker = ticker, beginDate = beginDate, endDate = endDate, field = ['tradeDate', 'Close'], pandas = '1').loc[:]['Close'].values
-		ma = np.mean([float(idx) for idx in idxs])
-		return ma
-	
-	
-	def __MA(self, secID, days):
-		ma = {}
-		
-		if isinstance(secID, basestring):
-			secID = [secID]
-		
-		for stock in secID:
-			trade = self.__getTrades([stock], days = days)
-			prices = trade.loc[:]['closePrice'].values
-			ma[stock] = np.mean([float(price) for price in prices])
-		
-		return ma if len(secID) > 1 else ma[ma.keys()[0]]
-	
-	def __getTrades(self, secID, field = [], **kw):
-		if isinstance(secID, basestring):
-			secID = [secID]
-
-		if 'days' in kw.keys():
-			beginDate = self.__calendar.advanceDate(self.__date, '-' + str(kw['days']) + 'B')
-			endDate = self.__calendar.advanceDate(self.__date, '-1B')
-		elif 'beginDate' in kw.keys() and 'endDate' in kw.keys():
-			beginDate = kw['beginDate']
-			endDate = kw['endDate']
-		else:
-			raise ValueError('__getTrades takes days or (beginDate and endDate) as parameters')
-
-		sql = '(secID == "' + '" | secID == "'.join(secID) + '") & tradeDate >= "' + beginDate.strftime('%Y-%m-%d') + '" & tradeDate <= "' + endDate.strftime('%Y-%m-%d') + '"'
-
-		if 'secID' not in self.__tradeCache.columns or self.__tradeCache.query(sql).empty:
-			fields = list(set(field + ['secID', 'tradeDate', 'closePrice']))
-			self.__tradeCache = DataAPI.MktEqudGet(
-				secID = self.__stockPool,
-				beginDate = beginDate,
-				endDate = self.__calendar.advanceDate(endDate, '+100B'),
-				field = list(set(field + ['secID', 'tradeDate', 'closePrice'])),
-				pandas = '1'
-			)
-			log.info(sql + ' missing')
-		#fields = list(set(field + ['secID', 'tradeDate', 'closePrice']))
-		# self.__tradeCache = DataAPI.MktEqudGet(
-		#     secID = self.__stockPool,
-		#     beginDate = beginDate,
-		#     endDate = self.__calendar.advanceDate(endDate, '+100B'),
-		#     field = list(set(field + ['secID', 'tradeDate', 'closePrice'])),
-		#     pandas = '1'
-		# )
-		return self.__tradeCache.query(sql)
+  
