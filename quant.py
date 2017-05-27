@@ -1,21 +1,159 @@
 import datetime
 import numpy as np
 import pandas as pd
+
 from sklearn.svm import SVC
 from sklearn.cross_validation import train_test_split
 
-
-
 start_date ='20161031'
 end_date = '20170105'
-factor_date = '20161031'#为了获取10月末的因子数据而设定的日期参数
-index = '000300.SH'#沪深300指数
-# stock_sample = get_index_stocks(index,start_date)#选取起始时间作为参数来构建沪深300指数成分股股票池
-# trade_days = get_trade_days(start_date,end_date)#获取交易日时段
-
-trade_days = get_all_trade_days()
 factors = ['factor_ma', 'factor_bbi']
 
+#初始化账户       
+def initialize(account):      
+	account.sample = '000300.SH'
+	account.max_stocks = 5 # 最大持有股数
+	cal = CAL()
+	samples = get_index_stocks(account.sample, end_date)
+
+	pass
+	
+#设置买卖条件，每个交易频率（日/分钟/tick）调用一次   
+def handle_data(account,data): 
+	currentDay = get_datetime()
+	samples = get_index_stocks(account.sample, end_date)
+
+	log.info(currentDay)
+	quant = Quant(account,data,currentDay)
+	samples = get_index_stocks(account.sample, end_date)
+	endDate = get_datetime().strftime('%Y%m%d')
+	cal = CAL()
+	beginDate = cal.getDateByAdvance(endDate, -5)
+	test = quant.timing(samples)
+
+class Quant(object):
+	def __init__(self, account,data,currentDay):
+		self.account = account
+		self.stockPool = []
+		self.bought = []
+		self.data = data
+		self.currentDay = currentDay
+		self.cal = CAL()
+		
+	def pickStocks(self):
+		pass
+	
+	def timing(self, stocks = []):
+		if not stocks:
+			stocks = self.stockPool
+		
+		buylist = train_model(self.data,stocks, self.currentDay)
+		log.info(buylist[:5].values)
+		market = '000001.SH'
+		marketMA1 = self.MA(market, 1)
+		marketMA100 = self.MA(market, 100)
+		
+		for stock in buylist[:5]:
+			self.account.security = stock
+
+			cal = CAL()
+			MACD = self.MACD(stock, get_datetime())['factor_macd'].values
+			
+			stockMA = (self.MA(stock, 20) + self.MA(stock, 30)) / 2
+			
+			log.info(MACD)
+			
+			if MACD < 0:
+				# to do sell all
+				order_target(self.account.security,0)
+				self.bought = []
+			elif marketMA1 > marketMA100:
+				if stock not in self.bought and marketMA1 > marketMA100 * 1.03:
+					self.positionControl(stock)
+					self.bought.append(stock)
+				elif stock in self.bought and marketMA1 < marketMA100 * 0.97:
+					# to do sell stock
+					order_target(self.account.security,0)
+					self.bought.remove(stock)
+					
+	def MACD(self, stock, date):
+		
+		q = query(
+			factor.macd
+		).filter(
+			factor.symbol == stock,
+			factor.date == date.strftime("%Y-%m-%d")
+		)
+		return get_factors(q)
+		
+					
+	def MA(self, stock, period):
+		closePrices = self.getPrice(stock, period)['close']
+		closePrices = closePrices[closePrices.columns[0]].values
+		return np.mean([float(price) for price in closePrices])
+	
+	def getPrice(self, stocks, period, fields = []):
+		if not isinstance(stocks, list):
+			stocks = [stocks,]
+		
+		endDate = get_datetime()
+		cal = CAL()
+		beginDate = cal.getDateByAdvance(endDate, -int(period - 1))
+		
+		return get_price(
+			stocks,
+			start_date = beginDate,
+			end_date = endDate,
+			fre_step = '1d',
+			fields = list(set(fields + ['close'])),
+			skip_paused = True,
+			is_panel = 1,
+		)
+					
+	def positionControl(self,stock):
+		#获取每只股票的进仓量
+		positionQuantity = self.stockMaxQuantity(stock)
+		#产生下单信号
+		order_to(stock, positionQuantity)
+		log.info(self.account.position)
+				
+	
+	def stockMaxQuantity(self,stock):
+		#最大风险随时
+		max_lose = self.account.cash * self.risk
+		beginDate = self.cal.getDateByAdvance(self.currentDate,-10)
+		log.info(beginDate)
+		#获取今日最高价
+		highestPrice = self.getPrice(stock,1,['high'])
+		#10十日内收盘价
+		historyTrade10 = self.self.getPrice(stock,19,['close'])['close'].sort_index(by='close')
+		# #10日内最低价格
+		min10 = historyTrade10['closePrice'].values[0]
+		# #止损点
+		lowerLimit = min10 * (1 - 0.08)
+		# #计算交易量
+		volume = max_lose / (highestPrice - lowerLimit)
+		return volume
+	
+	def stopProfile(self):
+		#10十日内收盘价
+		historyTrade10 = self.__getTrades([stock],days=10).sort_index(by='closePrice')['closePrice'].values  
+		#10日内最高价
+		max10 = historyTrade10[-1:]
+		#10日内最低价
+		min10 = historyTrade10[0]
+
+		#获取今日最高价
+		highestPrice = self.getPrice(stock,1,['close'])['close'].values[0]
+
+		#止盈
+		upperLimit = max10 * (1+0.08) 
+		#止损
+		lowerLimit = min10 * (1-0.08) 
+		#买卖信号
+		dealSingal = (highestPrice > upperLimit) or (highestPrice < lowerLimit)
+		return dealSingal
+	
 class CAL(object):
 	def __init__(self):
 		#获取所交易日
@@ -32,15 +170,13 @@ class CAL(object):
 			queryCondition = 'date>="' + date + '"'
 		else:            
 			queryCondition = 'date>="' + date.strftime('%Y%m%d') + '"'
-			log.info(queryCondition)
 
 		date = self.tradeDate.query(queryCondition)
 		return datetime.datetime.strptime(date['date'].values[0], "%Y%m%d")
 
 	def getDateByAdvance(self,date,step):
-		log.info(date)
+		# log.info(date)
 		queryCondition = 'date>= "' + self.getDate(date).strftime('%Y%m%d') + '"'
-		log.info(queryCondition)
 
 		index = int(self.tradeDate.query(queryCondition).index[0])+step
 		
@@ -48,13 +184,12 @@ class CAL(object):
 		if index >=0 and index < self.tradeDate.shape[0]:
 			return datetime.datetime.strptime(self.tradeDate['date'].values[index], "%Y%m%d")
 		return None
-
+		
 def train_model(data,samples, currentDay):
-	# trade_days = get_trade_days(beginDate, endDate).strftime('%Y-%m-%d')
-	# currentDay = trade_days[1]
 	cal = CAL()
 	lastDay = cal.getDateByAdvance(currentDay,-1).strftime('%Y-%m-%d')
 	currentDay = currentDay.strftime("%Y-%m-%d")
+
 	log.info("获取因子...")
 	#获取因子数据
 	factor_df = pd.DataFrame(columns=['stockID', 'factor_date'] + factors)
@@ -69,7 +204,6 @@ def train_model(data,samples, currentDay):
 	log.info("获取每日收盘价...")
 	#获取每日收盘价
 	samplePrice = data.history(samples, 'close', 2, '1d', skip_paused = False, fq = None, is_panel = 1)
-	# samplePrice = get_price(samples, beginDate, endDate, '1d', ['close'], True, None,is_panel=1)
 	closePrice = samplePrice['close']
 	closeIndex = closePrice.index
 	
@@ -126,52 +260,5 @@ def train_model(data,samples, currentDay):
 	# #选概率大于0.5的股
 	test=X_test[X_test['predict']>=0.5]
 	buylist=test['stockID'][:20]#选概率最大的20只股票
-	log.info(buylist)
 
 	return buylist
-
-#初始化账户       
-def initialize(account): 
-	account.sample = '000300.SH'
-	account.max_stocks = 5 # 最大持有股数
-	cal = CAL()
-	# end_date = datetime.datetime.strptime("2016-5-23", "%Y-%m-%d")
-	# begin_date = datetime.datetime.strptime(cal.getDateByAdvance(end_date,-1), "%Y%m%d")
-	samples = get_index_stocks(account.sample, end_date)
-	
-	# train_model(account,samples, begin_date.strftime("%Y%m%d"), end_date.strftime("%Y%m%d"))
-
-	pass
-	
-
-#设置买卖条件，每个交易频率（日/分钟/tick）调用一次   
-def handle_data(account,data): 
-	currentDay = get_datetime()
-	samples = get_index_stocks(account.sample, end_date)
-	buylist = train_model(data,samples,currentDay)
-	# log.info(buylist[:])
-	account.security = buylist[0:5]
-	
-	close = data.attribute_history(account.security, ['close'], 20, '1d')      
-	#计算五日均线价格      
-	MA5 = close.values[-5:].mean()      
-	#计算二十日均线价格      
-	MA20 = close.values.mean()      
-	#如果五日均线大于二十日均线      
-	if MA5 > MA20:        
-		#使用所有现金买入证券 
-		order_value(account.security,account.cash)
-
-		# for i in range(5):
-		#记录这次买入        
-		log.info("买入 %s" % (account.security))       
-	#如果五日均线小于二十日均线，并且目前有头寸      
-	if MA5 < MA20 and account.positions_value > 0:        
-		#卖出所有证券        
-		order_target(account.security,0)        
-		#记录这次卖出        
-		log.info("卖出 %s" % (account.security))
-	
-	pass
-
-  
